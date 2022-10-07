@@ -217,7 +217,7 @@ class XMLSignatureProcessor(XMLProcessor):
             c14n = c14n.replace(b' xmlns=""', b"")
         return c14n
 
-    def _resolve_reference(self, doc_root, reference, uri_resolver=None):
+    def _resolve_reference(self, doc_root, reference, uri_resolver=None, emortgage_package_files=None):
         uri = reference.get("URI")
         if not uri:
             return doc_root
@@ -234,12 +234,22 @@ class XMLSignatureProcessor(XMLProcessor):
                     return results[0]
             raise InvalidInput("Unable to resolve reference URI: {}".format(uri))
         else:
-            if uri_resolver is None:
-                raise InvalidInput("External URI dereferencing is not configured: {}".format(uri))
-            result = uri_resolver(uri)
-            if result is None:
+            if emortgage_package_files is None:
+                if uri_resolver is None:
+                    raise InvalidInput("External URI dereferencing is not configured: {}".format(uri))
+                result = uri_resolver(uri)
+                if result is None:
+                    raise InvalidInput("Unable to resolve reference URI: {}".format(uri))
+                return result
+            else:
+                ext_file_name_uri = uri
+                try:
+                    for file in emortgage_package_files:
+                        if file.get('file_name') == ext_file_name_uri:
+                            return file.get('file_body')
+                except TypeError:
+                    raise InvalidInput("Expected data type of the emortgage_package_files parameter is a list")
                 raise InvalidInput("Unable to resolve reference URI: {}".format(uri))
-            return result
 
 
 class XMLSigner(XMLSignatureProcessor):
@@ -730,6 +740,7 @@ class XMLVerifier(XMLSignatureProcessor):
         id_attributes=None,
         expect_references=1,
         ignore_ambiguous_key_info=False,
+        emortgage_package_files=None
     ):
         """
         Verify the XML signature supplied in the data and return the XML node signed by the signature, or raise an
@@ -818,6 +829,10 @@ class XMLVerifier(XMLSignatureProcessor):
             necessary to match the keys, and throws an InvalidInput error instead. Set this to True to bypass the error
             and validate the signature using X509Data only.
         :type ignore_ambiguous_key_info: boolean
+        :param emortgage_package_files:
+            Passing a list of external files nested in the eMortgage package to search external Reference URIs
+            sample data: [{'file_name': 'some file name', 'file_body': 'some file body in bytes'}]
+        :type emortgage_package_files: list
 
         :raises: :py:class:`cryptography.exceptions.InvalidSignature`
 
@@ -841,6 +856,9 @@ class XMLVerifier(XMLSignatureProcessor):
 
         # HACK: deep copy won't keep root's namespaces
         signature = self.fromstring(self.tostring(signature_ref))
+
+        # Summary validation resultat
+        validation_result = []
 
         if validate_schema:
             self.schema().assertValid(signature)
@@ -901,6 +919,14 @@ class XMLVerifier(XMLSignatureProcessor):
             signature_digest_method = self._get_signature_digest_method(signature_alg).name
             if "ecdsa-" in signature_alg:
                 raw_signature = self._encode_dss_signature(raw_signature, signing_cert.get_pubkey().bits())
+
+            signature_validation_result = {
+                'name': 'Signature validation',
+                'status': 'PASSED',
+                'details': 'Signature validation PASSED, as expected',
+                'DigestMethod': signature_digest_method,
+            }
+
             try:
                 verify(signing_cert, raw_signature, signed_info_c14n, signature_digest_method)
             except OpenSSLCryptoError as e:
@@ -908,7 +934,12 @@ class XMLVerifier(XMLSignatureProcessor):
                     lib, func, reason = e.args[0][0]
                 except Exception:
                     reason = e
-                raise InvalidSignature("Signature verification failed: {}".format(reason))
+                # raise InvalidSignature("Signature verification failed: {}".format(reason))
+
+                signature_validation_result['status'] = 'FAILED'
+                signature_validation_result['details'] = 'Signature verification failed: {}'.format(reason)
+            finally:
+                validation_result.append(signature_validation_result)
 
             # If both X509Data and KeyValue are present, match one against the other and raise an error on mismatch
             if key_value is not None:
@@ -975,10 +1006,38 @@ class XMLVerifier(XMLSignatureProcessor):
             transforms = self._find(reference, "Transforms", require=False)
             digest_alg = self._find(reference, "DigestMethod").get("Algorithm")
             digest_value = self._find(reference, "DigestValue")
-            payload = self._resolve_reference(copied_root, reference, uri_resolver=uri_resolver)
-            payload_c14n = self._apply_transforms(payload, transforms, copied_signature_ref, c14n_algorithm)
+
+            reference_validation = {
+                'name': 'Reference validation',
+                'status': 'PASSED',
+                'details': 'Computed Digest must be equal to DigestValue, as expected',
+                'URI': reference.get('URI'),
+                'Transforms': transforms.text if transforms is not None else None,
+                'DigestMethod': digest_alg,
+                'DigestValue': digest_value.text if digest_value is not None else None,
+                'Computed Digest': ''
+            }
+
+            # If emortgage_package_files is not None, then reference URIs referring to external files attempt to find file_body among emortgage_package_files and return the result of the file body in bytes
+            try:
+                payload = self._resolve_reference(copied_root, reference, uri_resolver=uri_resolver, emortgage_package_files=emortgage_package_files)
+            except signxml.exceptions.InvalidInput as e:
+                reference_validation['status'] = 'FAILED'
+                reference_validation['details'] = str(e)
+                validation_result.append(reference_validation)
+                continue
+
+            if isinstance(payload, bytes):
+                payload_c14n = payload
+            else:
+                payload_c14n = self._apply_transforms(payload, transforms, copied_signature_ref, c14n_algorithm)
             if b64decode(digest_value.text) != self._get_digest(payload_c14n, self._get_digest_method(digest_alg)):
-                raise InvalidDigest("Digest mismatch for reference {}".format(len(verify_results)))
+                # raise InvalidDigest("Digest mismatch for reference {}".format(len(verify_results)))
+
+                reference_validation['status'] = 'FAILED'
+                reference_validation['details'] = 'Digest mismatch for reference'
+
+            reference_validation['Computed Digest'] = b64encode(self._get_digest(payload_c14n, self._get_digest_method(digest_alg))).decode()
 
             # We return the signed XML (and only that) to ensure no access to unsigned data happens
             try:
@@ -987,9 +1046,14 @@ class XMLVerifier(XMLSignatureProcessor):
                 payload_c14n_xml = None
             verify_results.append(VerifyResult(payload_c14n, payload_c14n_xml, signature))
 
+            validation_result.append(reference_validation)
+
         if type(expect_references) is int and len(verify_results) != expect_references:
             msg = "Expected to find {} references, but found {}"
             raise InvalidSignature(msg.format(expect_references, len(verify_results)))
+
+        import json
+        print(json.dumps(validation_result, indent=4))
 
         return verify_results if expect_references > 1 else verify_results[0]
 
