@@ -1018,10 +1018,13 @@ class XMLVerifier(XMLSignatureProcessor):
                 'Computed Digest': ''
             }
 
-            # If emortgage_package_files is not None, then reference URIs referring to external files attempt to find file_body among emortgage_package_files and return the result of the file body in bytes
+            # If emortgage_package_files is not None, then reference URIs referring to external files attempt to find
+            # file_body among emortgage_package_files and return the result of the file body in bytes
             try:
-                payload = self._resolve_reference(copied_root, reference, uri_resolver=uri_resolver, emortgage_package_files=emortgage_package_files)
-            except signxml.exceptions.InvalidInput as e:
+                payload = self._resolve_reference(
+                    copied_root, reference, uri_resolver=uri_resolver, emortgage_package_files=emortgage_package_files
+                )
+            except InvalidInput as e:
                 reference_validation['status'] = 'FAILED'
                 reference_validation['details'] = str(e)
                 validation_result.append(reference_validation)
@@ -1037,7 +1040,9 @@ class XMLVerifier(XMLSignatureProcessor):
                 reference_validation['status'] = 'FAILED'
                 reference_validation['details'] = 'Digest mismatch for reference'
 
-            reference_validation['Computed Digest'] = b64encode(self._get_digest(payload_c14n, self._get_digest_method(digest_alg))).decode()
+            reference_validation['Computed Digest'] = b64encode(
+                self._get_digest(payload_c14n, self._get_digest_method(digest_alg))
+            ).decode()
 
             # We return the signed XML (and only that) to ensure no access to unsigned data happens
             try:
