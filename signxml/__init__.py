@@ -10,6 +10,8 @@ from cryptography.hazmat.primitives.hashes import SHA1, SHA224, SHA256, SHA384, 
 from cryptography.hazmat.primitives.serialization import load_der_public_key
 from lxml import etree
 from lxml.etree import Element, SubElement
+from OpenSSL import SSL
+from OpenSSL.crypto import X509StoreContext, X509StoreContextError
 
 from .exceptions import InvalidCertificate, InvalidDigest, InvalidInput, InvalidSignature  # noqa
 from .util import (
@@ -858,7 +860,7 @@ class XMLVerifier(XMLSignatureProcessor):
         signature = self.fromstring(self.tostring(signature_ref))
 
         # Summary validation resultat
-        validation_result = []
+        ui_validation_results = []
 
         if validate_schema:
             self.schema().assertValid(signature)
@@ -920,11 +922,13 @@ class XMLVerifier(XMLSignatureProcessor):
             if "ecdsa-" in signature_alg:
                 raw_signature = self._encode_dss_signature(raw_signature, signing_cert.get_pubkey().bits())
 
-            signature_validation_result = {
-                'name': 'Signature validation',
+            signature_validation = {
+                'name': 'Signature verification',
                 'status': 'PASSED',
-                'details': 'Signature validation PASSED, as expected',
-                'DigestMethod': signature_digest_method,
+                'details': 'Signature is verified, as expected',
+                'CanonicalizationMethod': c14n_algorithm,
+                'SignatureMethod': signature_alg,
+                'SignatureValue': b64encode(raw_signature).decode() if raw_signature is not None else '',
             }
 
             try:
@@ -936,10 +940,21 @@ class XMLVerifier(XMLSignatureProcessor):
                     reason = e
                 # raise InvalidSignature("Signature verification failed: {}".format(reason))
 
-                signature_validation_result['status'] = 'FAILED'
-                signature_validation_result['details'] = 'Signature verification failed: {}'.format(reason)
+                signature_validation['status'] = 'FAILED'
+                signature_validation['details'] = 'Signature verification failed: {}'.format(reason)
+
+                # Check certificate is self-signed
+                try:
+                    context = SSL.Context(SSL.TLSv1_METHOD)
+                    cert = load_certificate(FILETYPE_PEM, add_pem_header(self.x509_cert))
+                    store = context.get_cert_store()
+                    X509StoreContext(store, cert).verify_certificate()
+                except X509StoreContextError as e:
+                    if str(e) == 'self-signed certificate':
+                        signature_validation['details'] = 'Invalid digital signature: the certificate is self-signed and cannot be trusted'
+
             finally:
-                validation_result.append(signature_validation_result)
+                ui_validation_results.append(signature_validation)
 
             # If both X509Data and KeyValue are present, match one against the other and raise an error on mismatch
             if key_value is not None:
@@ -1010,7 +1025,7 @@ class XMLVerifier(XMLSignatureProcessor):
             reference_validation = {
                 'name': 'Reference validation',
                 'status': 'PASSED',
-                'details': 'Computed Digest must be equal to DigestValue, as expected',
+                'details': 'Computed Digest is equal to DigestValue, as expected',
                 'URI': reference.get('URI'),
                 'Transforms': transforms.text if transforms is not None else None,
                 'DigestMethod': digest_alg,
@@ -1027,7 +1042,7 @@ class XMLVerifier(XMLSignatureProcessor):
             except InvalidInput as e:
                 reference_validation['status'] = 'FAILED'
                 reference_validation['details'] = str(e)
-                validation_result.append(reference_validation)
+                ui_validation_results.append(reference_validation)
                 continue
 
             if isinstance(payload, bytes):
@@ -1038,7 +1053,7 @@ class XMLVerifier(XMLSignatureProcessor):
                 # raise InvalidDigest("Digest mismatch for reference {}".format(len(verify_results)))
 
                 reference_validation['status'] = 'FAILED'
-                reference_validation['details'] = 'Digest mismatch for reference'
+                reference_validation['details'] = 'Computed Digest must be equal to DigestValue'
 
             reference_validation['Computed Digest'] = b64encode(
                 self._get_digest(payload_c14n, self._get_digest_method(digest_alg))
@@ -1049,18 +1064,18 @@ class XMLVerifier(XMLSignatureProcessor):
                 payload_c14n_xml = self.fromstring(payload_c14n)
             except etree.XMLSyntaxError:
                 payload_c14n_xml = None
+
             verify_results.append(VerifyResult(payload_c14n, payload_c14n_xml, signature))
 
-            validation_result.append(reference_validation)
+            ui_validation_results.append(reference_validation)
 
-        if type(expect_references) is int and len(verify_results) != expect_references:
-            msg = "Expected to find {} references, but found {}"
-            raise InvalidSignature(msg.format(expect_references, len(verify_results)))
+        # if type(expect_references) is int and len(verify_results) != expect_references:
+        #     msg = "Expected to find {} references, but found {}"
+        #     raise InvalidSignature(msg.format(expect_references, len(verify_results)))
+        #
+        # return verify_results if expect_references > 1 else verify_results[0]
 
-        import json
-        print(json.dumps(validation_result, indent=4))
-
-        return verify_results if expect_references > 1 else verify_results[0]
+        return ui_validation_results
 
     def check_key_value_matches_cert_public_key(self, key_value, public_key, signature_alg):
         if "ecdsa-" in signature_alg and isinstance(public_key.to_cryptography_key(), ec.EllipticCurvePublicKey):
